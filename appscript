@@ -1,0 +1,134 @@
+// 請將您的 GPT API key 填入這裡
+const GPT_API_KEY = 'API here';
+
+function onOpen() {
+  var ui = SpreadsheetApp.getUi();
+  ui.createMenu('自定義功能')
+      .addItem('導入幻燈片數據', 'importSlideData')
+      .addToUi();
+}
+
+function importSlideData() {
+  if (!GPT_API_KEY || GPT_API_KEY === 'your_api_key_here') {
+    SpreadsheetApp.getUi().alert('錯誤：請在腳本中設置 GPT API 密鑰。');
+    return;
+  }
+
+  var spreadsheet = SpreadsheetApp.getActiveSpreadsheet();
+  var dataSheet = spreadsheet.getSheetByName('data');
+  var dataRange = dataSheet.getDataRange();
+  var dataValues = dataRange.getValues();
+
+  // 列的順序是: event_date, name, slide_url, completed_time
+  var unprocessedSlides = dataValues.slice(1).filter(function(row) {
+    return row[2] && !row[3];  // 有 slide_url 但沒有 completed_time
+  });
+
+  if (unprocessedSlides.length === 0) {
+    SpreadsheetApp.getUi().alert('沒有新的幻燈片需要處理。');
+    return;
+  }
+
+  for (var i = 0; i < unprocessedSlides.length; i++) {
+    var eventDate = unprocessedSlides[i][0];
+    var slideUrl = unprocessedSlides[i][2];
+    var rowIndex = dataValues.findIndex(function(row) {
+      return row[2] === slideUrl;
+    }) + 1;  // +1 因為 getRange 是 1-indexed
+
+    processSlide(eventDate, slideUrl, rowIndex);
+  }
+
+  SpreadsheetApp.getUi().alert('所有新的幻燈片已處理完成。');
+}
+
+function processSlide(eventDate, slideUrl, rowIndex) {
+  var spreadsheet = SpreadsheetApp.getActiveSpreadsheet();
+  var dataSheet = spreadsheet.getSheetByName('data');
+
+  try {
+    var presentation = SlidesApp.openByUrl(slideUrl);
+  } catch (e) {
+    Logger.log('錯誤：無法打開 URL 為 ' + slideUrl + ' 的 Google Slides。');
+    return;
+  }
+
+  var slides = presentation.getSlides();
+
+  // 創建新的工作表，以 event_date 命名
+  var sheetName = Utilities.formatDate(eventDate, Session.getScriptTimeZone(), "yyyy-MM-dd");
+  var newSheet = spreadsheet.insertSheet(sheetName);
+
+  // 設置新工作表的標題行
+  var headers = ["與會者（我叫）", "腳色（我在）", "簡介（我最近）", "專案名稱", "目標", "說明", "關鍵字", "文件連結", "程式碼 or Prompt", "遇到的困難", "補充"];
+  newSheet.getRange(1, 1, 1, headers.length).setValues([headers]);
+
+  // 遍歷幻燈片並提取數據
+  var row = 2;  // 從第二行開始寫入數據
+  for (var i = 0; i < slides.length; i++) {
+    var slide = slides[i];
+    var text = slide.getShapes().map(function(shape) {
+      return shape.getText().asString();
+    }).join(' ');
+
+    var data = processSlideWithGPT(text);
+
+    // 將提取的數據寫入新工作表
+    newSheet.getRange(row, 1, 1, data.length).setValues([data]);
+    row++;
+
+    // 添加延遲以避免超過 API 速率限制
+    Utilities.sleep(1000);
+  }
+
+  // 更新 data 工作表中的完成時間
+  var completionTime = new Date();
+  dataSheet.getRange(rowIndex, 4).setValue(Utilities.formatDate(completionTime, Session.getScriptTimeZone(), "yyyy-MM-dd HH:mm:ss"));
+
+  Logger.log('幻燈片 ' + slideUrl + ' 處理完成。新工作表 "' + sheetName + '" 已創建。');
+}
+
+function processSlideWithGPT(text) {
+  var prompt = "從以下文本中提取相關信息，沒有提及的填入 N/A，並按照給定的格式返回：\n\n" + text + "\n\n" +
+               "格式：\n與會者（我叫）：\n腳色（我在）：\n簡介（我最近）：\n專案名稱：\n目標：\n說明：\n關鍵字：\n文件連結：\n程式碼 or Prompt：\n遇到的困難：\n補充：";
+
+  var requestBody = {
+    "model": "gpt-4o",
+    "messages": [{"role": "user", "content": prompt}],
+    "temperature": 0.3
+  };
+
+  var options = {
+    'method': 'post',
+    'contentType': 'application/json',
+    'payload': JSON.stringify(requestBody),
+    'headers': {
+      'Authorization': 'Bearer ' + GPT_API_KEY
+    }
+  };
+
+  try {
+    var response = UrlFetchApp.fetch('https://api.openai.com/v1/chat/completions', options);
+    var responseData = JSON.parse(response.getContentText());
+    var extractedText = responseData.choices[0].message.content;
+    
+    // 解析 GPT 的回應
+    return parseGPTResponse(extractedText);
+  } catch (e) {
+    Logger.log('API 調用錯誤: ' + e);
+    return new Array(11).fill('API 錯誤');
+  }
+}
+
+function parseGPTResponse(response) {
+  var fields = ["與會者（我叫）", "腳色（我在）", "簡介（我最近）", "專案名稱", "目標", "說明", "關鍵字", "文件連結", "程式碼 or Prompt", "遇到的困難", "補充"];
+  var data = [];
+  
+  fields.forEach(function(field) {
+    var regex = new RegExp(field + "[:：]\\s*(.+)");
+    var match = response.match(regex);
+    data.push(match ? match[1].trim() : "");
+  });
+  
+  return data;
+}
